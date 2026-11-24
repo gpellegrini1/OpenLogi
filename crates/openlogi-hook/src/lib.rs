@@ -244,6 +244,15 @@ pub fn source_is_remappable(device: Option<&EventDevice>) -> bool {
     }
 }
 
+/// The HID identity of the device that typed a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeySource {
+    /// HID vendor id.
+    pub vendor_id: u16,
+    /// HID product id.
+    pub product_id: u16,
+}
+
 /// A keyboard event observed by the hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -253,6 +262,9 @@ pub struct KeyEvent {
     pub pressed: bool,
     /// Which modifiers were held.
     pub modifiers: KeyModifiers,
+    /// The device that typed the key, where the platform attributes key
+    /// events to their sender (macOS); `None` elsewhere or when unknown.
+    pub source: Option<KeySource>,
 }
 
 /// Anything the OS hook can observe. `Mouse` preserves the existing callback

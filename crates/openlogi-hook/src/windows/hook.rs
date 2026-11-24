@@ -594,6 +594,8 @@ fn translate_key(
         keycode: mac_keycode(data.vkCode)?,
         pressed,
         modifiers,
+        // The low-level keyboard hook does not name the sending device.
+        source: None,
     })
 }
 

@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use openlogi_core::app::ForegroundApp;
 use openlogi_core::binding::{
-    ActionRingIcon, Binding, ButtonId, GamingButtons, GamingLayout, GridKey, KeypadPage, ModeKey,
+    ActionRingIcon, Binding, ButtonId, GamingButtons, GamingLayout, GridKey, KeyedMouse,
+    KeypadPage, ModeKey,
 };
 use openlogi_core::bindings::{bindings_on_page, button_bindings_for, oshook_gestures_for};
 use openlogi_core::config::{
@@ -55,7 +56,7 @@ use crate::notices::LowBatteryWatch;
 use crate::observable::ObservableState;
 use crate::pointer_speed::{AppWrite, ReloadChange, SavedSpeed, SpeedMouse, SpeedWrite};
 use crate::receiver_access::ReceiverAccess;
-use crate::runtime::hook::{HookMaps, SharedHookMaps};
+use crate::runtime::hook::{GenericMouseMaps, GenericMouseSource, HookMaps, SharedHookMaps};
 use crate::runtime::scroll::ScrollPreferences;
 use crate::runtime::{PageTurn, PointerSelection};
 use crate::watchers::host_switch::{HostSwitchLink, HostSwitchLinks, LinkedHostSwitch};
@@ -124,6 +125,17 @@ impl AgentDevice {
     fn resolve_config_key(&self, config: &Config) -> Option<PhysicalDeviceKey> {
         let identity = DeviceIdentity::from_parts(self.serial.as_deref(), self.unit_id);
         config.resolve_device_key(&stable_id(self), self.online.then_some(&identity))
+    }
+
+    /// The OS input identity of a listed generic (non-Logitech) mouse, which
+    /// the OS hook remaps by event source. `None` for every HID++ device and
+    /// every other raw device.
+    fn generic_mouse_source(&self) -> Option<GenericMouseSource> {
+        let (vendor_id, product_id) = self.route.as_ref()?.generic_mouse_ids()?;
+        Some(GenericMouseSource {
+            vendor_id,
+            product_id,
+        })
     }
 }
 
@@ -1037,11 +1049,15 @@ impl Orchestrator {
     /// half-populated write.
     fn hook_maps_for(&self, selected: Option<&AgentDevice>) -> HookMaps {
         let key = selected.map(|device| device.config_key.as_str());
+        let generic_mice = self.generic_mouse_maps();
         // A disabled selected device gets empty maps: the OS hook then passes
         // its events through untouched instead of applying remaps to a device
         // the user asked OpenLogi to leave alone.
         if key.is_some_and(|k| !self.config.device_enabled(k)) {
-            return HookMaps::default();
+            return HookMaps {
+                generic_mice,
+                ..HookMaps::default()
+            };
         }
         let (app, pointer_target) = self.mouse_context();
         let pointer = self.pointer_selection(key, app, pointer_target);
@@ -1077,8 +1093,39 @@ impl Orchestrator {
             // names a link its capture session is not on.
             selected_route: selected.and_then(|device| device.route.clone()),
             shift_bindings,
+            generic_mice,
             ..HookMaps::default()
         }
+    }
+
+    /// The OS-hook maps of every online, enabled generic mouse, resolved for
+    /// the current mouse context. These never depend on the GUI's selection:
+    /// a generic mouse cannot be the selected capture target, and each press
+    /// is matched to its own entry by event source.
+    fn generic_mouse_maps(&self) -> Vec<GenericMouseMaps> {
+        let (app, pointer_target) = self.mouse_context();
+        self.devices
+            .iter()
+            .filter(|dev| dev.online && self.config.device_enabled(&dev.config_key))
+            .filter_map(|dev| {
+                let source = dev.generic_mouse_source()?;
+                let key = dev.config_key.as_str();
+                let keyed = dev.route.as_ref().and_then(KeyedMouse::for_route);
+                Some(GenericMouseMaps {
+                    source,
+                    keyed,
+                    // A keyed mouse's layout seeds its key-typing buttons with
+                    // the chords' own effects, which leave them native.
+                    bindings: button_bindings_for(
+                        &self.config,
+                        Some(key),
+                        app,
+                        keyed.map(|mouse| &mouse.layout),
+                    ),
+                    pointer: self.pointer_selection(Some(key), app, pointer_target),
+                })
+            })
+            .collect()
     }
 
     /// Whether `key` is a G-series mouse: one with a layout, or any other
@@ -1089,7 +1136,12 @@ impl Orchestrator {
             .iter()
             .find(|dev| dev.config_key == key)
             .is_some_and(|dev| {
-                GamingButtons::for_device(&dev.model_key, dev.capabilities.as_ref()).is_some()
+                GamingButtons::for_device(
+                    &dev.model_key,
+                    dev.route.as_ref(),
+                    dev.capabilities.as_ref(),
+                )
+                .is_some()
             })
     }
 
@@ -1529,6 +1581,11 @@ impl Orchestrator {
         let mut plans = Vec::new();
         let mut routes = BTreeMap::new();
         for dev in &self.devices {
+            // A generic mouse has no HID++ channel to capture on; the OS hook
+            // owns all of its remapping.
+            if dev.generic_mouse_source().is_some() {
+                continue;
+            }
             let Some((physical_key, route)) = Self::capture_identity(dev) else {
                 continue;
             };

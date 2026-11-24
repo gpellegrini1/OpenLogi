@@ -140,7 +140,9 @@ impl DetailTab {
         // A G-series mouse has no ReprogControls, but the OS hook still remaps
         // its middle/back/forward, so it gets the panel too. The model draws
         // only what such a mouse can deliver (#392, #730, #877).
-        let gaming = GamingButtons::for_device(&record.model_key, Some(&caps)).is_some();
+        let gaming =
+            GamingButtons::for_device(&record.model_key, record.route.as_ref(), Some(&caps))
+                .is_some();
         let buttons = caps.buttons || gaming;
         if buttons && can_show_mouse_model {
             tabs.push(Self::Buttons);
@@ -171,7 +173,14 @@ impl DetailTab {
         if caps.haptic_panel || (buttons && can_show_mouse_model && !gaming) || shows_keys_tab {
             tabs.push(Self::ActionsRing);
         }
+        // A generic (non-Logitech) mouse only has its buttons remapped: the
+        // hook's software inversion applies to Logitech sources alone.
+        let generic_mouse = record
+            .route
+            .as_ref()
+            .is_some_and(|route| route.generic_mouse_ids().is_some());
         let has_software_scroll = openlogi_hook::SOFTWARE_SCROLL_INVERSION
+            && !generic_mouse
             && record.capabilities.is_some()
             && matches!(record.kind, DeviceKind::Mouse | DeviceKind::Trackball);
         if caps.pointer

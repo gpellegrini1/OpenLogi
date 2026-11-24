@@ -2167,7 +2167,7 @@ fn a_gaming_keyboard_gets_no_keys_or_mouse_tabs() {
         0x8010, 0x8040, 0x8100, 0x8060, 0x00c2, 0x00d0,
     ]);
     assert_eq!(
-        openlogi_core::binding::GamingButtons::for_device("0c339", Some(&g713)),
+        openlogi_core::binding::GamingButtons::for_device("0c339", None, Some(&g713)),
         Some(openlogi_core::binding::GamingButtons::Standard)
     );
     let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, Some(g713)));

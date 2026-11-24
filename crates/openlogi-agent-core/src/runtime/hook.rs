@@ -12,13 +12,15 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use openlogi_core::binding::KeyedMouse;
 use openlogi_core::binding::{
     Action, Binding, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
 };
 use openlogi_core::config::KeyTrigger;
 use openlogi_hid::DeviceRoute;
 use openlogi_hook::{
-    EventDevice, EventDisposition, Hook, HookEvent, KeyEvent, MouseEvent, source_is_remappable,
+    EventDevice, EventDisposition, Hook, HookEvent, KeyEvent, KeyModifiers, KeySource, MouseEvent,
+    source_is_remappable,
 };
 use tracing::{debug, info, warn};
 
@@ -61,6 +63,76 @@ pub struct HookMaps {
     /// Devices with a G-Shift button held, set by HID++ capture. Survives map
     /// rebuilds like `diverted_buttons`.
     pub(crate) shift_held: BTreeSet<String>,
+    /// Every listed, enabled non-Logitech mouse, each with its own maps. A
+    /// press from one of them resolves against its entry by event-source
+    /// identity, never against the selected device's maps.
+    pub(crate) generic_mice: Vec<GenericMouseMaps>,
+}
+
+/// The OS input identity of a generic (non-Logitech) mouse: the vendor and
+/// product ids its events carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GenericMouseSource {
+    pub(crate) vendor_id: u16,
+    pub(crate) product_id: u16,
+}
+
+impl GenericMouseSource {
+    /// Whether `source` is this mouse. Two connected units of one model
+    /// report the same ids, so they share one entry's bindings.
+    fn is_source_of(self, source: &EventDevice) -> bool {
+        !source.is_trackpad_like()
+            && source.vendor_id == Some(u32::from(self.vendor_id))
+            && source.product_id == Some(u32::from(self.product_id))
+    }
+
+    /// Whether a key typed by `source` came from this mouse.
+    fn typed(self, source: KeySource) -> bool {
+        (source.vendor_id, source.product_id) == (self.vendor_id, self.product_id)
+    }
+}
+
+/// One generic mouse's OS-hook maps. Gestures are not resolved for these
+/// sources: a gesture binding degrades to its click action.
+#[derive(Debug)]
+pub(crate) struct GenericMouseMaps {
+    pub(crate) source: GenericMouseSource,
+    /// The chords its key-typing buttons send, for a listed keyed mouse.
+    pub(crate) keyed: Option<&'static KeyedMouse>,
+    pub(crate) bindings: BTreeMap<ButtonId, Binding>,
+    pub(crate) pointer: Option<PointerSelection>,
+}
+
+impl GenericMouseMaps {
+    /// The press inputs for `id`, shaped like the selected device's.
+    fn press(&self, id: ButtonId) -> PressInputs {
+        PressInputs {
+            binding: self.bindings.get(&id).cloned(),
+            is_gesture: false,
+            pointer: self.pointer.as_ref().map(|pointer| pointer.press(id)),
+            diverted: None,
+        }
+    }
+
+    /// The button a key-down typed by this mouse stands for, with its press
+    /// inputs. `None` keeps the chord native: it is not one of the mouse's
+    /// buttons, or that button is still bound to the chord's own effect.
+    fn key_press(&self, keycode: u16, modifiers: KeyModifiers) -> Option<(ButtonId, PressInputs)> {
+        let keyed = self.keyed?;
+        let id = keyed.button_for_key(keycode, modifiers)?;
+        let stock = keyed.layout.stock_action(id).map(Binding::Single);
+        let binding = self.bindings.get(&id);
+        (binding.is_some() && binding != stock.as_ref()).then(|| (id, self.press(id)))
+    }
+}
+
+/// Everything a press needs from one coherent maps snapshot.
+#[derive(Default)]
+struct PressInputs {
+    binding: Option<Binding>,
+    is_gesture: bool,
+    pointer: Option<PointerPress>,
+    diverted: Option<DivertedPress>,
 }
 
 impl HookMaps {
@@ -93,6 +165,51 @@ impl HookMaps {
             pointer.unscoped_press()
         } else {
             pointer.press(id)
+        })
+    }
+
+    /// The generic mouse that produced an event from `source`, if any.
+    fn generic_mouse(&self, source: Option<&EventDevice>) -> Option<&GenericMouseMaps> {
+        let source = source?;
+        self.generic_mice
+            .iter()
+            .find(|mouse| mouse.source.is_source_of(source))
+    }
+
+    /// The button and press inputs for a key-down typed by `source`, when a
+    /// listed keyed mouse typed it as one of its rebound buttons.
+    fn generic_key_press(
+        &self,
+        source: KeySource,
+        keycode: u16,
+        modifiers: KeyModifiers,
+    ) -> Option<(ButtonId, PressInputs)> {
+        self.generic_mice
+            .iter()
+            .find(|mouse| mouse.source.typed(source))?
+            .key_press(keycode, modifiers)
+    }
+
+    /// The press inputs for `id` from `source` when that source may be
+    /// remapped: a generic mouse reads its own entry, a remappable Logitech
+    /// source the selected device's maps. `None` leaves the press native.
+    fn press_inputs(
+        &self,
+        id: ButtonId,
+        source: Option<&EventDevice>,
+        logitech: bool,
+    ) -> Option<PressInputs> {
+        if let Some(mouse) = self.generic_mouse(source) {
+            return Some(mouse.press(id));
+        }
+        logitech.then(|| {
+            let (binding, is_gesture) = self.press_binding(id);
+            PressInputs {
+                binding,
+                is_gesture,
+                pointer: self.pointer_press(id),
+                diverted: self.diverted_press(id, source),
+            }
         })
     }
 
@@ -361,6 +478,10 @@ thread_local! {
     /// matching key-up ends the lifecycle. A button's repeated press is the
     /// opposite, a lost release, which is why keys stay out of `PRESSES`.
     static HELD_KEYS: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+    /// Keys a keyed generic mouse typed as one of its rebound buttons, by
+    /// keycode, so the key-up ends that button's press whatever modifiers
+    /// the mouse has already let go of. A repeated key-down is auto-repeat.
+    static GENERIC_KEYS: RefCell<HashMap<u16, ButtonId>> = RefCell::new(HashMap::new());
 }
 
 /// Whether a button event's physical source may be remapped/suppressed.
@@ -434,33 +555,44 @@ fn handle_button(
     capture_safari_pid: impl FnOnce() -> Option<i32>,
 ) -> EventDisposition {
     // Primary L/R always pass through (suppressing them would brick the mouse).
-    if !id.is_os_hook_button() || !button_source_may_remap(device) {
+    if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
     }
+    let logitech = button_source_may_remap(device);
+    // `try_read` only: a blocking read on the tap thread freezes every pointer
+    // event while a config rebuild holds the write lock. Fail open if unavailable.
+    let inputs = match hooks.try_read() {
+        Ok(maps) => maps.press_inputs(id, device, logitech),
+        // An unreadable snapshot cannot name a generic mouse: a Logitech press
+        // still enters (and fails open), and a release is judged by `PRESSES`,
+        // which holds only presses some earlier snapshot admitted.
+        Err(_) => (logitech || !pressed).then(PressInputs::default),
+    };
+    let Some(inputs) = inputs else {
+        return EventDisposition::PassThrough;
+    };
     if !pressed {
         // Drop the PRESSES borrow before any queueing (re-entrancy freeze hazard).
         let released = PRESSES.with_borrow_mut(|presses| presses.release(id));
         return end_press(id, released, hooks, dispatcher);
     }
-    // `try_read` only: a blocking read on the tap thread freezes every pointer
-    // event while a config rebuild holds the write lock. Fail open if unavailable.
-    let (binding, is_gesture, pointer, diverted) =
-        hooks.try_read().map_or((None, false, None, None), |maps| {
-            let (binding, is_gesture) = maps.press_binding(id);
-            (
-                binding,
-                is_gesture,
-                maps.pointer_press(id),
-                maps.diverted_press(id, device),
-            )
-        });
-    let phase = match diverted {
+    press_button(id, inputs, capture_safari_pid, dispatcher)
+}
+
+/// Enter the press of a button the hook may remap and record its phase.
+fn press_button(
+    id: ButtonId,
+    inputs: PressInputs,
+    capture_safari_pid: impl FnOnce() -> Option<i32>,
+    dispatcher: &ActionDispatcher,
+) -> EventDisposition {
+    let phase = match inputs.diverted {
         Some(diverted) => PressPhase::Diverted(diverted),
         None => start_press(
             id,
-            binding,
-            is_gesture,
-            ActionDispatchTarget::for_pointer(pointer, capture_safari_pid),
+            inputs.binding,
+            inputs.is_gesture,
+            ActionDispatchTarget::for_pointer(inputs.pointer, capture_safari_pid),
             dispatcher,
         ),
     };
@@ -596,6 +728,39 @@ fn handle_moved(
     EventDisposition::PassThrough
 }
 
+/// Remap a key a keyed generic mouse typed as one of its buttons, through
+/// that button's press lifecycle. `None` hands the key to [`handle_key`].
+fn handle_generic_key(
+    event: KeyEvent,
+    hooks: &SharedHookMaps,
+    dispatcher: &ActionDispatcher,
+    capture_safari_pid: impl FnOnce() -> Option<i32>,
+) -> Option<EventDisposition> {
+    let KeyEvent {
+        keycode,
+        pressed,
+        modifiers,
+        source,
+    } = event;
+    if !pressed {
+        let id = GENERIC_KEYS.with_borrow_mut(|keys| keys.remove(&keycode))?;
+        // Drop the PRESSES borrow before any queueing (re-entrancy freeze hazard).
+        let released = PRESSES.with_borrow_mut(|presses| presses.release(id));
+        return Some(end_press(id, released, hooks, dispatcher));
+    }
+    if GENERIC_KEYS.with_borrow(|keys| keys.contains_key(&keycode)) {
+        return Some(EventDisposition::Suppress);
+    }
+    // `try_read` only, as for buttons; an unreadable snapshot leaves the key
+    // to the keyboard path.
+    let (id, inputs) = hooks
+        .try_read()
+        .ok()?
+        .generic_key_press(source?, keycode, modifiers)?;
+    GENERIC_KEYS.with_borrow_mut(|keys| keys.insert(keycode, id));
+    Some(press_button(id, inputs, capture_safari_pid, dispatcher))
+}
+
 /// Remap one function-key edge without blocking the hook callback.
 fn handle_key(
     event: KeyEvent,
@@ -608,6 +773,7 @@ fn handle_key(
         keycode,
         pressed,
         modifiers,
+        ..
     } = event;
     if !pressed {
         return HELD_KEYS.with_borrow_mut(|keys| {
@@ -723,13 +889,21 @@ pub fn start(
         // held chord or held modifiers enter the same down/up/cancel
         // lifecycle as a mouse button. The active set pairs key-up even if
         // modifier state or config changes while the key is down.
-        HookEvent::Key(event) => handle_key(
+        HookEvent::Key(event) => handle_generic_key(
             event,
-            &keyboard_bindings,
-            &action_tx,
+            &hooks,
             &dispatcher,
-            ActionDispatchTarget::capture,
-        ),
+            openlogi_hook::frontmost_safari_pid,
+        )
+        .unwrap_or_else(|| {
+            handle_key(
+                event,
+                &keyboard_bindings,
+                &action_tx,
+                &dispatcher,
+                ActionDispatchTarget::capture,
+            )
+        }),
     });
 
     match result {

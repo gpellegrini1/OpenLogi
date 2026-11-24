@@ -11,7 +11,7 @@ use core_graphics::event::{CGEvent, CGEventField, CGEventFlags, CGEventType, Eve
 use tracing::debug;
 
 use super::sender::{event_sender_id, sender_device_info};
-use crate::{ButtonId, KeyEvent, KeyModifiers, MouseEvent, ScrollDelta};
+use crate::{ButtonId, EventDevice, KeyEvent, KeyModifiers, KeySource, MouseEvent, ScrollDelta};
 
 /// Translate a raw OS button number to a [`ButtonId`].
 ///
@@ -140,8 +140,11 @@ pub(super) fn translate_key(etype: CGEventType, event: &CGEvent) -> Option<KeyEv
     };
     if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
         == openlogi_inject::SYNTHETIC_EVENT_USER_DATA
-        || from_virtual_keyboard(event)
     {
+        return None;
+    }
+    let sender = event_sender_id(event).map(|sender| sender_device_info(sender).event_device);
+    if sender.as_ref().is_some_and(from_virtual_keyboard) {
         return None;
     }
     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
@@ -150,19 +153,25 @@ pub(super) fn translate_key(etype: CGEventType, event: &CGEvent) -> Option<KeyEv
         keycode,
         pressed,
         modifiers: modifiers_from_flags(event.get_flags()),
+        source: sender.as_ref().and_then(key_source),
     })
 }
 
-/// Whether `event` came from OpenLogi's virtual HID keyboard. Its keys
+/// Whether a key's sender is OpenLogi's virtual HID keyboard. Its keys
 /// carry no source user data, because the HID event system, not OpenLogi,
 /// creates their `CGEvent`s; the device's product name identifies them.
-fn from_virtual_keyboard(event: &CGEvent) -> bool {
-    event_sender_id(event).is_some_and(|sender| {
-        sender_device_info(sender)
-            .event_device
-            .product_name
-            .as_deref()
-            .is_some_and(openlogi_inject::is_virtual_keyboard_product)
+fn from_virtual_keyboard(sender: &EventDevice) -> bool {
+    sender
+        .product_name
+        .as_deref()
+        .is_some_and(openlogi_inject::is_virtual_keyboard_product)
+}
+
+/// The HID ids of a key's sender, when IOKit published both.
+fn key_source(sender: &EventDevice) -> Option<KeySource> {
+    Some(KeySource {
+        vendor_id: u16::try_from(sender.vendor_id?).ok()?,
+        product_id: u16::try_from(sender.product_id?).ok()?,
     })
 }
 

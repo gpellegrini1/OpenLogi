@@ -3,7 +3,9 @@
 
 use super::action::Action;
 use super::button::ButtonId;
+use crate::config::KeyModifiers;
 use crate::device::Capabilities;
+use crate::hid::DeviceRoute;
 
 /// One `0x8110` slot of a G-series mouse.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +40,18 @@ impl Slot {
             button,
             host_silent: true,
             stock: None,
+        }
+    }
+
+    /// A button of a [`KeyedMouse`]: it types a key chord whose native
+    /// effect is `stock`. While its binding is `stock` the chord passes
+    /// through untouched, so the default is the mouse's own behaviour.
+    #[must_use]
+    pub const fn keyed(button: ButtonId, stock: Action) -> Self {
+        Self {
+            button,
+            host_silent: false,
+            stock: Some(stock),
         }
     }
 
@@ -131,6 +145,111 @@ pub const STANDARD_BUTTONS: GamingLayout = GamingLayout {
 
 const LAYOUTS: &[&GamingLayout] = &[&G502_LIGHTSPEED, &G903_LIGHTSPEED];
 
+/// A button of a [`KeyedMouse`] that reaches the host as a key chord rather
+/// than as a HID button. `keycode` is the platform-neutral keycode the hook
+/// reports (macOS `kVK_*`, which every hook backend translates into).
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyButton {
+    /// The chord's key.
+    pub keycode: u16,
+    /// The modifiers the mouse holds with it.
+    pub modifiers: KeyModifiers,
+    /// The button the chord stands for.
+    pub button: ButtonId,
+}
+
+/// A non-Logitech mouse, listed by the generic-mouse driver, whose extra
+/// buttons type key chords through the mouse's own keyboard collection.
+/// The OS hook attributes each chord to its sender, so the same chord typed
+/// on a real keyboard is never taken for the button.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyedMouse {
+    /// HID vendor id.
+    pub vendor_id: u16,
+    /// HID product id.
+    pub product_id: u16,
+    /// The buttons the Buttons panel draws.
+    pub layout: GamingLayout,
+    /// The chord each key-typing button sends.
+    pub key_buttons: &'static [KeyButton],
+}
+
+/// macOS virtual keycode of F11 (`kVK_F11`).
+const KVK_F11: u16 = 0x67;
+/// macOS virtual keycode of Q (`kVK_ANSI_Q`).
+const KVK_ANSI_Q: u16 = 0x0c;
+
+/// Baseus BS-007Pro "Editor Pro", over Bluetooth LE. Its side button types
+/// F11 (Show Desktop) and the button behind the wheel types Control-Command-Q
+/// (Lock Screen); the wheel click is a standard middle button. G6 and G7 are
+/// the slots those two key-typing buttons take.
+pub const BASEUS_EDITOR_PRO: KeyedMouse = KeyedMouse {
+    vendor_id: 0xfff1,
+    product_id: 0x0010,
+    layout: GamingLayout {
+        model_keys: &[],
+        slots: &[
+            Slot::native(ButtonId::LeftClick),
+            Slot::native(ButtonId::RightClick),
+            Slot::native(ButtonId::MiddleClick),
+            Slot::keyed(ButtonId::G6, Action::ShowDesktop),
+            Slot::keyed(ButtonId::G7, Action::LockScreen),
+        ],
+        stock_dpi_presets: &[],
+    },
+    key_buttons: &[
+        KeyButton {
+            keycode: KVK_F11,
+            modifiers: KeyModifiers {
+                shift: false,
+                control: false,
+                option: false,
+                command: false,
+            },
+            button: ButtonId::G6,
+        },
+        KeyButton {
+            keycode: KVK_ANSI_Q,
+            modifiers: KeyModifiers {
+                shift: false,
+                control: true,
+                option: false,
+                command: true,
+            },
+            button: ButtonId::G7,
+        },
+    ],
+};
+
+const KEYED_MICE: &[&KeyedMouse] = &[&BASEUS_EDITOR_PRO];
+
+impl KeyedMouse {
+    /// The keyed mouse behind a generic-mouse route, if it is one.
+    #[must_use]
+    pub fn for_route(route: &DeviceRoute) -> Option<&'static Self> {
+        let (vendor_id, product_id) = route.generic_mouse_ids()?;
+        Self::for_ids(vendor_id, product_id)
+    }
+
+    /// The keyed mouse with these HID ids, if it is one.
+    #[must_use]
+    pub fn for_ids(vendor_id: u16, product_id: u16) -> Option<&'static Self> {
+        KEYED_MICE
+            .iter()
+            .copied()
+            .find(|mouse| (mouse.vendor_id, mouse.product_id) == (vendor_id, product_id))
+    }
+
+    /// The button a key-down of `keycode` with `modifiers` stands for.
+    #[must_use]
+    pub fn button_for_key(&self, keycode: u16, modifiers: KeyModifiers) -> Option<ButtonId> {
+        self.key_buttons
+            .iter()
+            .find(|key| key.keycode == keycode && key.modifiers == modifiers)
+            .map(|key| key.button)
+    }
+}
+
 /// Whether a device is a G-series mouse, and which buttons it offers. The
 /// agent, the tabs and the Buttons panel all ask this one verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,14 +261,25 @@ pub enum GamingButtons {
     /// nobody has dumped: only [`STANDARD_BUTTONS`], which the OS hook
     /// remaps.
     Standard,
+    /// A generic mouse whose extra buttons type key chords; the OS hook
+    /// remaps them by sender.
+    Keyed(&'static KeyedMouse),
 }
 
 impl GamingButtons {
-    /// The verdict for `model_key` with `capabilities`, which is `None` for a
-    /// device never probed; a dumped model answers without them. `None` for a
-    /// device that diverts its controls through ReprogControls.
+    /// The verdict for `model_key` on `route` with `capabilities`, which is
+    /// `None` for a device never probed; a dumped model or a keyed mouse
+    /// answers without them. `None` for a device that diverts its controls
+    /// through ReprogControls.
     #[must_use]
-    pub fn for_device(model_key: &str, capabilities: Option<&Capabilities>) -> Option<Self> {
+    pub fn for_device(
+        model_key: &str,
+        route: Option<&DeviceRoute>,
+        capabilities: Option<&Capabilities>,
+    ) -> Option<Self> {
+        if let Some(mouse) = route.and_then(KeyedMouse::for_route) {
+            return Some(Self::Keyed(mouse));
+        }
         if let Some(layout) = GamingLayout::for_model_key(model_key) {
             return Some(Self::Dumped(layout));
         }
@@ -164,6 +294,7 @@ impl GamingButtons {
         match self {
             Self::Dumped(layout) => layout,
             Self::Standard => &STANDARD_BUTTONS,
+            Self::Keyed(mouse) => &mouse.layout,
         }
     }
 }
@@ -231,17 +362,17 @@ mod tests {
         let gaming = Capabilities::from_feature_ids(&[0x2201, 0x8100, 0x8110]);
         let mx = Capabilities::from_feature_ids(&[0x1b04, 0x2201]);
         assert_eq!(
-            GamingButtons::for_device("0407f", None),
+            GamingButtons::for_device("0407f", None, None),
             Some(GamingButtons::Dumped(&G502_LIGHTSPEED)),
             "a dumped model answers before it is probed"
         );
         assert_eq!(
-            GamingButtons::for_device("0409f", Some(&gaming)),
+            GamingButtons::for_device("0409f", None, Some(&gaming)),
             Some(GamingButtons::Standard)
         );
         assert_eq!(GamingButtons::Standard.layout(), &STANDARD_BUTTONS);
-        assert_eq!(GamingButtons::for_device("0409f", None), None);
-        assert_eq!(GamingButtons::for_device("2b042", Some(&mx)), None);
+        assert_eq!(GamingButtons::for_device("0409f", None, None), None);
+        assert_eq!(GamingButtons::for_device("2b042", None, Some(&mx)), None);
     }
 
     #[test]
@@ -283,11 +414,64 @@ mod tests {
                 extended_model_id,
             };
             assert_eq!(
-                GamingButtons::for_device(&model.model_key(), Some(&gaming)),
+                GamingButtons::for_device(&model.model_key(), None, Some(&gaming)),
                 Some(GamingButtons::Dumped(&G502_LIGHTSPEED)),
                 "extended model id {extended_model_id}"
             );
         }
+    }
+
+    fn raw_route(vendor_id: u16, product_id: u16, usage_page: u16, usage_id: u16) -> DeviceRoute {
+        DeviceRoute::RawHid {
+            vendor_id,
+            product_id,
+            usage_page,
+            usage_id,
+            identity: "serial:20240500".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_keyed_mouse_route_answers_before_model_key_or_capabilities() {
+        let baseus = raw_route(0xfff1, 0x0010, 0x0001, 0x0002);
+        assert_eq!(
+            GamingButtons::for_device("Baseus Editor Pro", Some(&baseus), None),
+            Some(GamingButtons::Keyed(&BASEUS_EDITOR_PRO))
+        );
+        assert_eq!(
+            GamingButtons::Keyed(&BASEUS_EDITOR_PRO).layout(),
+            &BASEUS_EDITOR_PRO.layout
+        );
+        // Another collection of the same mouse is not its mouse route, and an
+        // unlisted generic mouse keeps the capability verdict.
+        let keyboard = raw_route(0xfff1, 0x0010, 0x0001, 0x0006);
+        assert_eq!(GamingButtons::for_device("x", Some(&keyboard), None), None);
+        let other = raw_route(0x1234, 0x0010, 0x0001, 0x0002);
+        assert_eq!(GamingButtons::for_device("x", Some(&other), None), None);
+    }
+
+    #[test]
+    fn keyed_mouse_chords_need_their_exact_modifiers() {
+        let none = KeyModifiers::default();
+        let lock = KeyModifiers {
+            control: true,
+            command: true,
+            ..KeyModifiers::default()
+        };
+        let baseus = &BASEUS_EDITOR_PRO;
+        assert_eq!(baseus.button_for_key(KVK_F11, none), Some(ButtonId::G6));
+        assert_eq!(baseus.button_for_key(KVK_ANSI_Q, lock), Some(ButtonId::G7));
+        assert_eq!(
+            baseus.button_for_key(KVK_ANSI_Q, none),
+            None,
+            "a bare Q is typing"
+        );
+        assert_eq!(baseus.button_for_key(KVK_F11, lock), None);
+        assert_eq!(
+            baseus.layout.stock_action(ButtonId::G6),
+            Some(Action::ShowDesktop)
+        );
+        assert!(!baseus.layout.needs_host_mode(ButtonId::G7));
     }
 
     #[test]

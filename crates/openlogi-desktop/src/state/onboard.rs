@@ -32,7 +32,11 @@ impl AppState {
     pub fn current_button_layout(&self) -> Option<&'static GamingLayout> {
         self.current_record()
             .and_then(|record| {
-                GamingButtons::for_device(&record.model_key, record.capabilities.as_ref())
+                GamingButtons::for_device(
+                    &record.model_key,
+                    record.route.as_ref(),
+                    record.capabilities.as_ref(),
+                )
             })
             .map(GamingButtons::layout)
     }

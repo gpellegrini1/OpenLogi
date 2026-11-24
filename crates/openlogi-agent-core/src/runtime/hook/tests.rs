@@ -356,6 +356,7 @@ fn queued_key_action_retains_its_press_time_target() {
                 keycode,
                 pressed: true,
                 modifiers: KeyModifiers::default(),
+                source: None,
             },
             &bindings,
             &actions,
@@ -397,6 +398,7 @@ fn held_actions_on_a_key_run_as_held_presses() {
                     keycode,
                     pressed,
                     modifiers,
+                    source: None,
                 },
                 &bindings,
                 &actions,
@@ -439,6 +441,7 @@ fn key_bound_to_easy_switch_passes_through_without_a_firing_device() {
                 keycode,
                 pressed: true,
                 modifiers,
+                source: None,
             },
             &bindings,
             &actions,
@@ -1249,5 +1252,279 @@ fn a_re_press_ends_a_lost_hold_before_its_motion_commits_a_phantom_swipe() {
         "no swipe fired"
     );
     assert_eq!(back(false), EventDisposition::Suppress);
+    assert!(owner.shutdown());
+}
+
+fn baseus() -> EventDevice {
+    EventDevice {
+        vendor_id: Some(0xfff1),
+        product_id: Some(0x0010),
+        product_name: Some("Baseus Editor Pro".into()),
+    }
+}
+
+fn generic_maps(binding: Action) -> HookMaps {
+    HookMaps {
+        // The selected Logitech device binds Back differently, so a press
+        // resolved against the wrong maps is visible.
+        bindings: BTreeMap::from([(ButtonId::Back, Action::Copy.into())]),
+        generic_mice: vec![GenericMouseMaps {
+            source: GenericMouseSource {
+                vendor_id: 0xfff1,
+                product_id: 0x0010,
+            },
+            keyed: None,
+            bindings: BTreeMap::from([(ButtonId::Back, binding.into())]),
+            pointer: None,
+        }],
+        ..HookMaps::default()
+    }
+}
+
+#[test]
+fn a_listed_generic_mouse_resolves_against_its_own_maps() {
+    let maps = generic_maps(Action::Paste);
+    let inputs = maps
+        .press_inputs(ButtonId::Back, Some(&baseus()), false)
+        .expect("a listed generic mouse may be remapped");
+    assert_eq!(inputs.binding, Some(Action::Paste.into()));
+    assert!(!inputs.is_gesture);
+    assert_eq!(inputs.diverted, None);
+}
+
+#[test]
+fn unlisted_or_trackpad_sources_never_read_generic_maps() {
+    let maps = generic_maps(Action::Paste);
+    let other_vendor = EventDevice {
+        vendor_id: Some(0x1234),
+        product_id: Some(0x0010),
+        product_name: Some("Other Mouse".into()),
+    };
+    let trackpad_with_same_ids = EventDevice {
+        product_name: Some("Baseus Trackpad".into()),
+        ..baseus()
+    };
+    for source in [Some(&other_vendor), Some(&trackpad_with_same_ids), None] {
+        assert!(
+            maps.press_inputs(ButtonId::Back, source, false).is_none(),
+            "{source:?} must stay native"
+        );
+    }
+    // A remappable Logitech source keeps reading the selected device's maps.
+    let logitech = EventDevice {
+        vendor_id: Some(0x046d),
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    let inputs = maps
+        .press_inputs(ButtonId::Back, Some(&logitech), true)
+        .expect("Logitech source");
+    assert_eq!(inputs.binding, Some(Action::Copy.into()));
+}
+
+#[test]
+fn a_generic_press_is_suppressed_and_its_release_paired() {
+    use super::super::button::ButtonRuntimeEvent;
+
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(generic_maps(Action::Paste)));
+    let source = baseus();
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&source),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::Suppress
+    );
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Started(_))
+    ));
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            false,
+            Some(&source),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::Suppress
+    );
+    // Middle stays native: its default binding is its own click.
+    assert_eq!(
+        handle_button(
+            ButtonId::MiddleClick,
+            true,
+            Some(&source),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::PassThrough
+    );
+    assert_eq!(
+        handle_button(
+            ButtonId::MiddleClick,
+            false,
+            Some(&source),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::PassThrough
+    );
+    assert!(owner.shutdown());
+}
+
+/// The Baseus maps with its side button (G6, typing F11) bound to `side`
+/// and its top button (G7, typing Control-Command-Q) left on its stock
+/// Lock Screen.
+fn keyed_maps(side: Action) -> HookMaps {
+    HookMaps {
+        generic_mice: vec![GenericMouseMaps {
+            source: GenericMouseSource {
+                vendor_id: 0xfff1,
+                product_id: 0x0010,
+            },
+            keyed: Some(&openlogi_core::binding::BASEUS_EDITOR_PRO),
+            bindings: BTreeMap::from([
+                (ButtonId::G6, side.into()),
+                (ButtonId::G7, Action::LockScreen.into()),
+            ]),
+            pointer: None,
+        }],
+        ..HookMaps::default()
+    }
+}
+
+const KVK_F11: u16 = 0x67;
+const KVK_ANSI_Q: u16 = 0x0c;
+
+fn baseus_key(keycode: u16, pressed: bool, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent {
+        keycode,
+        pressed,
+        modifiers,
+        source: Some(KeySource {
+            vendor_id: 0xfff1,
+            product_id: 0x0010,
+        }),
+    }
+}
+
+#[test]
+fn a_rebound_key_button_runs_as_a_suppressed_press_until_its_key_up() {
+    use super::super::button::ButtonRuntimeEvent;
+
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(keyed_maps(Action::MissionControl)));
+    let none = KeyModifiers::default();
+    let key = |pressed| {
+        handle_generic_key(
+            baseus_key(KVK_F11, pressed, none),
+            &hooks,
+            &dispatcher,
+            || None,
+        )
+    };
+
+    assert_eq!(key(true), Some(EventDisposition::Suppress));
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Started(_))
+    ));
+    assert_eq!(
+        key(true),
+        Some(EventDisposition::Suppress),
+        "auto-repeat stays inside the press"
+    );
+    assert_eq!(key(false), Some(EventDisposition::Suppress));
+    assert_eq!(key(false), None, "a second key-up has no press to end");
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn key_buttons_left_on_their_stock_effect_or_typed_elsewhere_stay_native() {
+    let (dispatcher, mut owner, _events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(keyed_maps(Action::MissionControl)));
+    let none = KeyModifiers::default();
+    let lock = KeyModifiers {
+        control: true,
+        command: true,
+        ..KeyModifiers::default()
+    };
+    let k250 = KeyEvent {
+        source: Some(KeySource {
+            vendor_id: 0x046d,
+            product_id: 0xb397,
+        }),
+        ..baseus_key(KVK_F11, true, none)
+    };
+    let unattributed = KeyEvent {
+        source: None,
+        ..baseus_key(KVK_F11, true, none)
+    };
+    for event in [
+        // G7 is still bound to Lock Screen, the chord's own effect.
+        baseus_key(KVK_ANSI_Q, true, lock),
+        // A bare Q is not one of the mouse's chords.
+        baseus_key(KVK_ANSI_Q, true, none),
+        // F11 from a real keyboard, or from no known sender.
+        k250,
+        unattributed,
+    ] {
+        assert_eq!(
+            handle_generic_key(event, &hooks, &dispatcher, || None),
+            None,
+            "{event:?} must reach the keyboard path"
+        );
+    }
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn a_chord_button_ends_on_its_key_up_after_the_modifiers_lift() {
+    use super::super::button::ButtonRuntimeEvent;
+
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let mut maps = keyed_maps(Action::None);
+    maps.generic_mice[0]
+        .bindings
+        .insert(ButtonId::G7, Action::MissionControl.into());
+    let hooks = Arc::new(RwLock::new(maps));
+    let lock = KeyModifiers {
+        control: true,
+        command: true,
+        ..KeyModifiers::default()
+    };
+
+    assert_eq!(
+        handle_generic_key(
+            baseus_key(KVK_ANSI_Q, true, lock),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        Some(EventDisposition::Suppress)
+    );
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Started(_))
+    ));
+    // The mouse lets go of Control and Command before Q.
+    assert_eq!(
+        handle_generic_key(
+            baseus_key(KVK_ANSI_Q, false, KeyModifiers::default()),
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        Some(EventDisposition::Suppress)
+    );
     assert!(owner.shutdown());
 }
