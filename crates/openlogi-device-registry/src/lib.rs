@@ -13,6 +13,7 @@
 
 pub mod camera;
 pub mod g600;
+pub mod generic_mouse;
 pub mod headset;
 pub mod keypad;
 pub mod litra;

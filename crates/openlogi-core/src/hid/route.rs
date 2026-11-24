@@ -128,6 +128,28 @@ impl From<&RawDeviceAddress> for DeviceRoute {
 }
 
 impl DeviceRoute {
+    /// The vendor and product ids of a listed generic (non-Logitech) mouse,
+    /// which its OS input events carry. `None` for every HID++ route and every
+    /// other raw device.
+    #[must_use]
+    pub fn generic_mouse_ids(&self) -> Option<(u16, u16)> {
+        match *self {
+            Self::RawHid {
+                vendor_id,
+                product_id,
+                usage_page,
+                usage_id,
+                ..
+            } if openlogi_device_registry::generic_mouse::is_generic_mouse_collection(
+                vendor_id, usage_page, usage_id,
+            ) =>
+            {
+                Some((vendor_id, product_id))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether two receiver routes use the same physical HID transport.
     /// Direct routes cannot prove identity because they carry only VID/PID.
     #[must_use]

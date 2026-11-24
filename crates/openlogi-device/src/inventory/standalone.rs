@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use openlogi_core::device::{Capabilities, DeviceKind, RawDeviceAddress, StandaloneDevice};
 use openlogi_device_registry::g600::{G600_DRIVER_ID, G600_NAME, matches_g600};
+use openlogi_device_registry::generic_mouse::{GENERIC_MOUSE_DRIVER_ID, matches_generic_mouse};
 use openlogi_device_registry::headset::{GAMING_HEADSET_DRIVER_ID, find_gaming_headset};
 use openlogi_device_registry::litra::find_litra;
 
@@ -110,6 +111,52 @@ pub(super) fn standalone_device(device: &crate::backend::NodeInfo) -> Option<Sta
             capabilities: Some(Capabilities::default()),
             light_capabilities: None,
             driver_id: G600_DRIVER_ID.to_owned(),
+            registry_model_id: None,
+        });
+    }
+
+    generic_mouse_device(device)
+}
+
+/// A third-party mouse collection the OS hook remaps by event source.
+fn generic_mouse_device(device: &crate::backend::NodeInfo) -> Option<StandaloneDevice> {
+    // A serial is required: the agent keys settings by a physical identity,
+    // and two serial-less nodes sharing a VID/PID/usage tuple would fail
+    // `validate_no_ambiguous_nodes` for the whole standalone inventory.
+    if matches_generic_mouse(
+        device.vendor_id,
+        device.usage_page,
+        device.usage_id,
+        &device.name,
+    ) && device
+        .serial_number
+        .as_deref()
+        .is_some_and(|serial| !serial.trim().is_empty())
+    {
+        return Some(StandaloneDevice {
+            address: RawDeviceAddress {
+                vendor_id: device.vendor_id,
+                product_id: device.product_id,
+                usage_page: device.usage_page,
+                usage_id: device.usage_id,
+                identity: device.identity(),
+            },
+            display_name: device.name.clone(),
+            manufacturer: device.manufacturer.clone(),
+            serial_number: device.serial_number.clone(),
+            unit_id: [0; 4],
+            kind: DeviceKind::Mouse,
+            online: true,
+            // The hook remaps only the OS-visible Middle/Back/Forward buttons.
+            // `button_spy` without `buttons` is what selects the standard
+            // five-button layout (`GamingButtons::Standard`) for the Buttons
+            // panel; no HID++ request is ever sent to this device.
+            capabilities: Some(Capabilities {
+                button_spy: true,
+                ..Capabilities::default()
+            }),
+            light_capabilities: None,
+            driver_id: GENERIC_MOUSE_DRIVER_ID.to_owned(),
             registry_model_id: None,
         });
     }
